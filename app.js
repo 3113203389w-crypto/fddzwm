@@ -53,6 +53,7 @@
       },
       shipment: {
         origin: "深圳", market: "US", fulfillment: "FBA", warehouse: "ONT8", quantity: 480,
+        splitEnabled: false, splits: [{ warehouse: "ONT8", cartonCount: 20, quantity: 480 }],
         unitsPerCarton: 24, cartonCount: 20, length: 54, width: 40, height: 35, cartonWeight: 15.5,
         declaredUnitValue: 7.5, dutyRate: 5, vatRate: 0, insurancePct: 0.3,
         inboundPlacementFee: 0, includeTaxes: true, useAwd: false, awdRegion: "west",
@@ -97,25 +98,34 @@
   function fx(currency) { return currency === "USD" ? state.settings.usdCny : currency === "GBP" ? state.settings.gbpCny : 1; }
   function localCurrency() { return MARKET[state.shipment.market].currency; }
   function toLocal(cny) { return cny / fx(localCurrency()); }
-  function warehouseMatch(q) { return q.warehouse === "*" || q.warehouse.toUpperCase() === state.shipment.warehouse.toUpperCase(); }
-
-  function shipmentMetrics(q) {
+  function warehouseMatch(q, warehouse) { return q.warehouse === "*" || q.warehouse.toUpperCase() === String(warehouse || state.shipment.warehouse).toUpperCase(); }
+  function activeSplits() {
     const s = state.shipment;
-    const cbm = s.length * s.width * s.height / 1000000 * s.cartonCount;
-    const actualKg = s.cartonWeight * s.cartonCount;
+    if (!s.splitEnabled || !Array.isArray(s.splits) || s.splits.length < 2) return [{ warehouse: s.warehouse, cartonCount: s.cartonCount, quantity: s.quantity }];
+    return s.splits.filter(x => x.warehouse && num(x.cartonCount) > 0).map(x => ({ warehouse: String(x.warehouse).toUpperCase(), cartonCount: num(x.cartonCount), quantity: num(x.quantity) }));
+  }
+  function warehouseLabel() { return activeSplits().map(x => x.warehouse).join(" + "); }
+
+  function shipmentMetrics(q, allocation) {
+    const s = state.shipment;
+    const cartonCount = allocation ? num(allocation.cartonCount) : s.cartonCount;
+    const quantity = allocation ? num(allocation.quantity) : s.quantity;
+    const cbm = s.length * s.width * s.height / 1000000 * cartonCount;
+    const actualKg = s.cartonWeight * cartonCount;
     const divisor = q && q.modeId === "express" ? state.settings.expressDivisor : state.settings.airDivisor;
-    const volumeKg = s.length * s.width * s.height / divisor * s.cartonCount;
-    return { cbm, cuft: cbm * 35.3147, actualKg, volumeKg, chargeKg: Math.max(actualKg, volumeKg), wm: Math.max(cbm, actualKg / 1000) };
+    const volumeKg = s.length * s.width * s.height / divisor * cartonCount;
+    return { cbm, cuft: cbm * 35.3147, actualKg, volumeKg, chargeKg: Math.max(actualKg, volumeKg), wm: Math.max(cbm, actualKg / 1000), cartonCount, quantity };
   }
 
-  function computeQuote(q) {
-    if (!q.enabled || num(q.rate) <= 0 || q.market !== state.shipment.market || q.fulfillment !== state.shipment.fulfillment || !warehouseMatch(q)) return null;
-    const s = state.shipment, m = shipmentMetrics(q), rate = num(q.rate), factor = fx(q.currency);
+  function computeQuote(q, allocation) {
+    const targetWarehouse = allocation ? allocation.warehouse : state.shipment.warehouse;
+    if (!q.enabled || num(q.rate) <= 0 || q.market !== state.shipment.market || q.fulfillment !== state.shipment.fulfillment || !warehouseMatch(q, targetWarehouse)) return null;
+    const s = state.shipment, m = shipmentMetrics(q, allocation), rate = num(q.rate), factor = fx(q.currency);
     let basisQty = 1, containerCount = 0;
     if (q.basis === "per_cbm") basisQty = m.cbm;
     if (q.basis === "per_kg") basisQty = m.chargeKg;
     if (q.basis === "wm") basisQty = m.wm;
-    if (q.basis === "per_carton") basisQty = s.cartonCount;
+    if (q.basis === "per_carton") basisQty = m.cartonCount;
     if (q.basis === "per_container") {
       const caps = { "20GP": 28, "40GP": 58, "40HQ": 68 };
       containerCount = Math.max(1, Math.ceil(m.cbm / (caps[s.containerType] * state.settings.fclUtilization / 100)));
@@ -126,30 +136,60 @@
     const origin = (num(q.originFee) + num(q.exportFee) + num(q.docFee)) * factor;
     const destination = (num(q.destFee) + num(q.deliveryFee)) * factor;
     const surcharge = freight * num(q.surchargePct) / 100;
-    const cargoValueCny = s.declaredUnitValue * s.quantity * fx(localCurrency());
+    const cargoValueCny = s.declaredUnitValue * m.quantity * fx(localCurrency());
     const insurance = cargoValueCny * num(s.insurancePct) / 100;
     const customsBase = cargoValueCny + freight + insurance;
     const duty = s.includeTaxes ? customsBase * num(s.dutyRate) / 100 : 0;
     const vat = s.includeTaxes ? (customsBase + duty) * num(s.vatRate) / 100 : 0;
-    const placement = num(s.inboundPlacementFee) * fx(localCurrency());
+    const placement = num(s.inboundPlacementFee) * fx(localCurrency()) * (m.quantity / Math.max(1, s.quantity));
     let amazon = placement;
     if (s.useAwd && s.market === "US") {
       const transportRate = s.awdTier === "managed" ? state.settings.awdTransportManaged : state.settings.awdTransportBase;
       const storageRate = s.awdRegion === "west"
         ? (s.awdTier === "managed" ? state.settings.awdStorageWestManaged : s.awdTier === "smart" ? state.settings.awdStorageWestSmart : state.settings.awdStorageWestBase)
         : (s.awdTier === "managed" ? state.settings.awdStorageOtherManaged : s.awdTier === "smart" ? state.settings.awdStorageOtherSmart : state.settings.awdStorageOtherBase);
-      amazon += (s.cartonCount * state.settings.awdInboundPerBox + m.cuft * transportRate + m.cuft * storageRate * num(s.awdMonths)) * state.settings.usdCny;
+      amazon += (m.cartonCount * state.settings.awdInboundPerBox + m.cuft * transportRate + m.cuft * storageRate * num(s.awdMonths)) * state.settings.usdCny;
     }
     const total = freight + origin + destination + surcharge + insurance + duty + vat + amazon;
     const days = (num(q.transitMin) + num(q.transitMax)) / 2 || 99;
     return {
       q, m, basisQty, containerCount, freight, origin, destination, surcharge, insurance, duty, vat, amazon, total,
-      perUnit: total / Math.max(1, s.quantity), days, expired: q.validUntil && q.validUntil < new Date().toISOString().slice(0, 10)
+      perUnit: total / Math.max(1, m.quantity), days, warehouse: targetWarehouse, expired: q.validUntil && q.validUntil < new Date().toISOString().slice(0, 10)
     };
   }
 
   function results() {
-    const list = state.quotes.map(computeQuote).filter(Boolean).sort((a, b) => a.total - b.total);
+    const splits = activeSplits();
+    let list;
+    if (state.shipment.splitEnabled && splits.length > 1) {
+      const groups = new Map();
+      state.quotes.filter(q => q.enabled && num(q.rate) > 0 && q.market === state.shipment.market && q.fulfillment === state.shipment.fulfillment).forEach(q => {
+        const key = q.quoteGroup ? `batch:${q.quoteGroup}` : `route:${q.carrier}::${q.modeId}`;
+        if (!groups.has(key)) groups.set(key, []);
+        groups.get(key).push(q);
+      });
+      list = [...groups.values()].map(quotes => {
+        const legs = splits.map(allocation => {
+          const candidates = quotes.filter(q => warehouseMatch(q, allocation.warehouse)).map(q => computeQuote(q, allocation)).filter(Boolean).sort((a,b) => a.total-b.total);
+          return candidates[0] || null;
+        });
+        if (legs.some(x => !x)) return null;
+        const sum = key => legs.reduce((t, x) => t + num(x[key]), 0);
+        const first = legs[0].q;
+        const carrier = first.carrier;
+        const sameMode = legs.every(x => x.q.modeId === first.modeId);
+        const total = sum("total");
+        const quantity = splits.reduce((t,x)=>t+num(x.quantity),0);
+        return {
+          q: { ...first, carrier, warehouse: splits.map(x=>x.warehouse).join(" + "), basis: "per_shipment", modeId: sameMode ? first.modeId : "seller_managed", validUntil: legs.map(x=>x.q.validUntil).filter(Boolean).sort()[0] || "" },
+          legs, split: true, m: { cbm: sumMetric(legs,"cbm"), actualKg: sumMetric(legs,"actualKg"), chargeKg: sumMetric(legs,"chargeKg"), wm: sumMetric(legs,"wm") },
+          freight: sum("freight"), origin: sum("origin"), destination: sum("destination"), surcharge: sum("surcharge"), insurance: sum("insurance"), duty: sum("duty"), vat: sum("vat"), amazon: sum("amazon"), total,
+          perUnit: total / Math.max(1, quantity), days: Math.max(...legs.map(x=>x.days)), expired: legs.some(x=>x.expired)
+        };
+      }).filter(Boolean).sort((a,b)=>a.total-b.total);
+    } else {
+      list = state.quotes.map(q => computeQuote(q, splits[0])).filter(Boolean).sort((a, b) => a.total - b.total);
+    }
     const maxCost = Math.max(...list.map(x => x.total), 1), maxDays = Math.max(...list.map(x => x.days), 1);
     list.forEach(r => {
       const completeness = [r.q.rate, r.q.transitMin, r.q.validUntil, r.q.warehouse].filter(Boolean).length / 4;
@@ -157,6 +197,7 @@
     });
     return list;
   }
+  function sumMetric(legs, key) { return legs.reduce((t,x)=>t+num(x.m && x.m[key]),0); }
 
   const NAV = [
     ["agent", "✦", "智能测算"], ["quotes", "▥", "动态报价库"], ["compare", "⇄", "方案对比"],
@@ -179,7 +220,7 @@
   }
 
   function renderAgent() {
-    const s = state.shipment, m = shipmentMetrics(), list = results(), best = list[0];
+    const s = state.shipment, m = shipmentMetrics(), splits = activeSplits(), routeLabel = warehouseLabel(), list = results(), best = list[0];
     return `<div class="agent-grid">
       <section class="panel chat-panel">
         <div class="panel-head"><div><h2>对话式费用 Agent</h2><p>自然语言录入货件、仓点与承运商报价</p></div><button class="ghost mini" data-action="clear-chat">清空</button></div>
@@ -187,7 +228,8 @@
         <div class="prompt-chips">
           <button class="chip" data-prompt="产品外箱 54×40×35cm，每箱15.5kg，共20箱480件，发美国ONT8 FBA">录入货件</button>
           <button class="chip" data-prompt="添加报价：捷航物流 ONT8 海运 880元/方，时效25-32天">添加单仓报价</button>
-          <button class="chip" data-prompt="报价：海星物流 ONT8 850元/方，ABE8 930元/方，FTW1 900元/方">添加多仓报价</button>
+          <button class="chip" data-prompt="分仓发货：ONT8 10箱240件，ABE8 6箱144件，FTW1 4箱96件">设置分仓货件</button>
+          <button class="chip" data-action="open-split-quote">批量录入分仓报价</button>
           <button class="chip" data-prompt="比较当前所有可用方案">比较方案</button>
         </div>
         <form class="chat-compose" id="chatForm"><textarea id="chatInput" rows="1" placeholder="例如：40×30×25cm，12kg/箱，30箱，发英国BHX4…"></textarea><button class="send-btn" title="发送">↑</button></form>
@@ -195,8 +237,8 @@
 
       <div>
         <div class="shipment-strip">
-          <div class="route"><div><small>起运地</small><br><b>${esc(s.origin)}</b></div><span class="route-line"></span><div><small>目的仓</small><br><b>${esc(s.warehouse)}</b></div></div>
-          <div><small>${MARKET[s.market].label} · ${s.fulfillment}${s.useAwd ? " · 经 AWD" : ""}</small><br><button class="link-btn" data-action="open-shipment">编辑货件 →</button></div>
+          <div class="route"><div><small>起运地</small><br><b>${esc(s.origin)}</b></div><span class="route-line"></span><div><small>${splits.length>1?"分仓目的地":"目的仓"}</small><br><b>${esc(routeLabel)}</b></div></div>
+          <div><small>${MARKET[s.market].label} · ${s.fulfillment}${splits.length>1?` · ${splits.length}仓合并计费`:""}${s.useAwd ? " · 经 AWD" : ""}</small><br><button class="link-btn" data-action="open-shipment">编辑货件 →</button></div>
         </div>
         <div class="summary-grid">
           <div class="metric"><span>总体积</span><strong>${fmt(m.cbm, 3)}<em>CBM</em></strong></div>
@@ -205,9 +247,9 @@
           <div class="metric"><span>收费吨 W/M</span><strong>${fmt(m.wm, 3)}<em>RT</em></strong></div>
         </div>
         <section class="panel">
-          <div class="panel-head"><div><h2>实时测算结果</h2><p>${list.length} 个有效方案匹配 ${esc(s.warehouse)}，税费${s.includeTaxes ? "已计入" : "未计入"}</p></div><button class="ghost mini" data-page="compare">完整对比</button></div>
+          <div class="panel-head"><div><h2>实时测算结果</h2><p>${list.length} 个承运商方案${splits.length>1?`完整覆盖 ${splits.length} 个仓点`:`匹配 ${esc(routeLabel)}`}，税费${s.includeTaxes ? "已计入" : "未计入"}</p></div><button class="ghost mini" data-page="compare">完整对比</button></div>
           <div class="panel-body">
-            ${best ? renderBest(best) : `<div class="empty-state"><div class="empty-icon">⌁</div><h3>还没有可计算的实时报价</h3><p>当前仓点没有单价大于 0 的有效报价。可在对话中粘贴承运商报价，或打开报价库录入。</p><button class="primary" data-action="open-quote">添加报价</button></div>`}
+             ${best ? renderBest(best) : `<div class="empty-state"><div class="empty-icon">⌁</div><h3>还没有可计算的完整报价</h3><p>${splits.length>1?"同一承运商需要为每个分仓仓点都提供有效报价，系统会逐仓计算并把费用相加。":"当前仓点没有单价大于 0 的有效报价。"}</p><button class="primary" data-action="${splits.length>1?"open-split-quote":"open-quote"}">${splits.length>1?"批量录入分仓报价":"添加报价"}</button></div>`}
             ${list.length > 1 ? `<div class="comparison-list">${list.slice(1, 4).map((r, i) => renderOption(r, i + 2)).join("")}</div>` : ""}
             <div class="warning" style="margin-top:14px">结果用于询价比选。实际账单仍受海关归类、偏远仓、查验、超长超重、旺季附加费及 Amazon 最终入仓计划影响。</div>
           </div>
@@ -219,10 +261,11 @@
   function renderBest(r) {
     const parts = [r.freight, r.origin, r.destination, r.duty + r.vat, r.amazon, r.surcharge + r.insurance];
     return `<article class="best-card">
-      <div class="best-top"><div><span class="best-badge">当前最低总成本</span><h3>${esc(r.q.carrier)}</h3><p>${esc(mode(r.q.modeId).name)} · ${BASIS_LABELS[r.q.basis]} · ${fmt(r.days,0)} 天</p></div><div class="best-price"><strong>${money(r.total)}</strong><span>≈ ${money(toLocal(r.total), localCurrency())} · ${money(r.perUnit, "CNY", 2)}/件</span></div></div>
+      <div class="best-top"><div><span class="best-badge">${r.split?"分仓合计总成本":"当前最低总成本"}</span><h3>${esc(r.q.carrier)}</h3><p>${esc(mode(r.q.modeId).name)} · ${r.split?`${r.legs.length} 个仓点逐仓计费`:BASIS_LABELS[r.q.basis]} · ${fmt(r.days,0)} 天</p></div><div class="best-price"><strong>${money(r.total)}</strong><span>≈ ${money(toLocal(r.total), localCurrency())} · ${money(r.perUnit, "CNY", 2)}/件</span></div></div>
       <div class="cost-track">${parts.map((v, i) => `<i style="width:${r.total ? v/r.total*100 : 0}%;background:${COLORS[i]}"></i>`).join("")}</div>
       <div class="cost-legend">${["主运费","起运费用","目的港/派送","关税/进口税","Amazon/AWD","附加/保险"].map((x,i)=>`<span><i style="background:${COLORS[i]}"></i>${x}</span>`).join("")}</div>
       <div class="breakdown"><div><span>主运费</span><b>${money(r.freight)}</b></div><div><span>清关与税费</span><b>${money(r.duty+r.vat)}</b></div><div><span>本地及派送</span><b>${money(r.origin+r.destination)}</b></div><div><span>Amazon / AWD</span><b>${money(r.amazon)}</b></div></div>
+      ${r.split ? `<div class="split-breakdown"><b>各仓费用明细（相加计入总费用）</b>${r.legs.map((leg,index)=>`<div><span><i class="split-index">${index+1}</i><strong>${esc(leg.warehouse)}</strong> · ${fmt(leg.m.cartonCount,0)}箱 / ${fmt(leg.m.quantity,0)}件<br><small>${money(leg.q.rate,leg.q.currency,2)} · ${BASIS_LABELS[leg.q.basis]}</small></span><strong>${money(leg.total)}</strong></div>`).join("")}<div class="split-formula">${r.legs.map(leg=>money(leg.total)).join(" + ")} = <strong>${money(r.total)}</strong></div><div class="split-total"><span>整批货全部仓点合计</span><strong>${money(r.total)}</strong></div></div>` : ""}
     </article>`;
   }
 
@@ -232,7 +275,7 @@
 
   function renderQuotes() {
     const qs = state.quotes.filter(q => (quoteFilter.market === "ALL" || q.market === quoteFilter.market) && (!quoteFilter.q || `${q.carrier} ${q.warehouse} ${mode(q.modeId).name}`.toLowerCase().includes(quoteFilter.q.toLowerCase())));
-    return `<div class="toolbar"><div class="toolbar-group"><input class="search" id="quoteSearch" placeholder="搜索承运商、仓点或方式" value="${esc(quoteFilter.q)}"><select class="select" id="quoteMarket"><option value="ALL">全部站点</option><option value="US" ${quoteFilter.market==="US"?"selected":""}>美国站</option><option value="UK" ${quoteFilter.market==="UK"?"selected":""}>英国站</option></select></div><div class="toolbar-group"><button class="ghost" data-action="import">导入 JSON</button><button class="ghost" data-action="export-csv">导出 CSV</button><button class="primary" data-action="open-quote">＋ 添加报价</button></div></div>
+    return `<div class="toolbar"><div class="toolbar-group"><input class="search" id="quoteSearch" placeholder="搜索承运商、仓点或方式" value="${esc(quoteFilter.q)}"><select class="select" id="quoteMarket"><option value="ALL">全部站点</option><option value="US" ${quoteFilter.market==="US"?"selected":""}>美国站</option><option value="UK" ${quoteFilter.market==="UK"?"selected":""}>英国站</option></select></div><div class="toolbar-group"><button class="ghost" data-action="import">导入 JSON</button><button class="ghost" data-action="export-csv">导出 CSV</button><button class="ghost split-action" data-action="open-split-quote">⇉ 分仓批量报价</button><button class="primary" data-action="open-quote">＋ 添加报价</button></div></div>
       <section class="panel"><div class="panel-head"><div><h2>承运商报价库</h2><p>每条报价绑定站点、仓点、计费方式和有效期；仓点数量不受限制</p></div><span class="tag live">${state.quotes.filter(x=>!x.demo).length} 条自有报价</span></div>
       <div class="table-wrap"><table><thead><tr><th>承运商 / 方式</th><th>站点</th><th>仓点</th><th>计费</th><th>单价</th><th>时效</th><th>有效期</th><th></th></tr></thead><tbody>
       ${qs.map(q => `<tr><td><span class="cell-main">${esc(q.carrier)}</span><span class="cell-sub">${esc(mode(q.modeId).name)}</span></td><td>${MARKET[q.market].flag} ${MARKET[q.market].label}</td><td><b>${esc(q.warehouse)}</b></td><td>${BASIS_LABELS[q.basis]}</td><td><b>${money(q.rate,q.currency,2)}</b></td><td>${q.transitMin}-${q.transitMax} 天</td><td><span class="tag ${q.demo?"demo":"live"}">${q.demo?"演示 · ":""}${esc(q.validUntil||"未设置")}</span></td><td><div class="row-actions"><button class="icon-btn" title="编辑" data-action="edit-quote" data-id="${q.id}">✎</button><button class="icon-btn" title="复制" data-action="copy-quote" data-id="${q.id}">⧉</button><button class="icon-btn" title="删除" data-action="delete-quote" data-id="${q.id}">×</button></div></td></tr>`).join("") || `<tr><td colspan="8"><div class="empty-state"><h3>没有匹配报价</h3><p>调整筛选条件或添加一条新报价。</p></div></td></tr>`}
@@ -240,8 +283,8 @@
   }
 
   function renderCompare() {
-    const list = results();
-    return `<section class="panel"><div class="panel-head"><div><h2>${esc(state.shipment.warehouse)} 可行方案排序</h2><p>默认按含税总成本排序；综合分同时考虑成本、时效与数据完整度</p></div><button class="ghost mini" data-action="open-shipment">调整货件</button></div><div class="panel-body">
+    const list = results(), splits = activeSplits();
+    return `<section class="panel"><div class="panel-head"><div><h2>${esc(warehouseLabel())} 可行方案排序</h2><p>${splits.length>1?"各承运商的分仓费用已按仓点分别计算后相加。":"默认按含税总成本排序；"}综合分同时考虑成本、时效与数据完整度</p></div><button class="ghost mini" data-action="open-shipment">调整货件</button></div><div class="panel-body">
       <div class="summary-grid"><div class="metric"><span>有效方案</span><strong>${list.length}<em>个</em></strong></div><div class="metric"><span>最低总成本</span><strong>${list[0]?money(list[0].total):"—"}</strong></div><div class="metric"><span>最低单件头程</span><strong>${list[0]?money(list[0].perUnit,"CNY",2):"—"}</strong></div><div class="metric"><span>最快时效</span><strong>${list.length?fmt(Math.min(...list.map(x=>x.days)),0):"—"}<em>天</em></strong></div></div>
       ${list.length ? `<div class="comparison-list">${list.map((r,i)=>renderOption(r,i+1)).join("")}</div><div style="margin-top:16px">${renderBest(list[0])}</div>` : `<div class="empty-state"><div class="empty-icon">⇄</div><h3>暂无可比方案</h3><p>至少录入一条与当前站点和仓点匹配、单价大于 0 的报价。</p><button class="primary" data-action="open-quote">添加报价</button></div>`}
       </div></section>`;
@@ -295,15 +338,16 @@
 
   function shipmentDialogHtml() {
     const s = state.shipment;
+    const splitText = (s.splits || []).map(x => `${x.warehouse}, ${x.cartonCount}, ${x.quantity}`).join("\n");
     return `<form method="dialog" id="shipmentForm"><div class="modal-head"><h2>编辑货件参数</h2><button type="button" class="icon-btn" data-action="close-dialog">×</button></div>
       <div class="form-section"><h3><span>1</span>路线与履约</h3><div class="field-grid cols-3">
         <div class="field"><label>起运城市</label><input name="origin" value="${esc(s.origin)}"></div>
         <div class="field"><label>目的站点</label><select name="market"><option value="US" ${s.market==="US"?"selected":""}>美国站</option><option value="UK" ${s.market==="UK"?"selected":""}>英国站</option></select></div>
         <div class="field"><label>履约模式</label><select name="fulfillment"><option ${s.fulfillment==="FBA"?"selected":""}>FBA</option><option ${s.fulfillment==="FBM"?"selected":""}>FBM</option></select></div>
-        <div class="field"><label>目的仓点 / 海外仓</label><input name="warehouse" value="${esc(s.warehouse)}" placeholder="ONT8 / BHX4 / 自定义"></div>
+        <div class="field"><label>单仓目的仓点</label><input name="warehouse" value="${esc(s.warehouse)}" placeholder="ONT8 / BHX4 / 自定义"></div>
         <div class="field"><label>件数</label><input type="number" name="quantity" value="${s.quantity}"></div>
         <div class="field"><label>每箱件数</label><input type="number" name="unitsPerCarton" value="${s.unitsPerCarton}"></div>
-      </div></div>
+      </div><div class="split-editor"><label><input type="checkbox" name="splitEnabled" ${s.splitEnabled?"checked":""}> 将整批货拆分到多个仓点，各仓费用分别计算后相加</label><div class="field"><label>分仓清单 <small>每行：仓点, 箱数, 件数</small></label><textarea name="splitText" placeholder="ONT8, 10, 240\nABE8, 6, 144\nFTW1, 4, 96">${esc(splitText)}</textarea></div></div></div>
       <div class="form-section"><h3><span>2</span>外箱数据</h3><div class="field-grid cols-3">
         ${dialogField("箱数","cartonCount",s.cartonCount,"箱")}${dialogField("外箱长","length",s.length,"cm")}${dialogField("外箱宽","width",s.width,"cm")}${dialogField("外箱高","height",s.height,"cm")}${dialogField("单箱毛重","cartonWeight",s.cartonWeight,"kg")}
         <div class="field"><label>整柜柜型</label><select name="containerType"><option ${s.containerType==="20GP"?"selected":""}>20GP</option><option ${s.containerType==="40GP"?"selected":""}>40GP</option><option ${s.containerType==="40HQ"?"selected":""}>40HQ</option></select></div>
@@ -344,8 +388,32 @@
       <div class="form-actions"><button type="button" class="ghost" data-action="close-dialog">取消</button><button class="primary" value="default">保存报价</button></div></form>`;
   }
 
+  function splitQuoteDialogHtml() {
+    const s = state.shipment;
+    const rows = s.splitEnabled && Array.isArray(s.splits) && s.splits.length > 1
+      ? s.splits.map(x => `${x.warehouse}, ${x.cartonCount}, ${x.quantity}, `).join("\n")
+      : `ONT8, 10, 240, 3500\nABE8, 6, 144, 2800\nFTW1, 4, 96, 2200`;
+    return `<form method="dialog" id="splitQuoteForm"><div class="modal-head"><div><h2>分仓批量报价</h2><p>一批货拆往多个仓点，每仓单独计费，最后自动相加</p></div><button type="button" class="icon-btn" data-action="close-dialog">×</button></div>
+      <div class="split-banner"><strong>计算方式</strong><span>仓点 A 费用 + 仓点 B 费用 + … = 整批货总费用</span></div>
+      <div class="form-section"><h3><span>1</span>承运商与计费规则</h3><div class="field-grid cols-3">
+        <div class="field"><label>承运商 / 方案名称</label><input required name="carrier" placeholder="如：海星物流"></div>
+        <div class="field"><label>目的站点</label><select name="market"><option value="US" ${s.market==="US"?"selected":""}>美国站</option><option value="UK" ${s.market==="UK"?"selected":""}>英国站</option></select></div>
+        <div class="field"><label>履约模式</label><select name="fulfillment"><option ${s.fulfillment==="FBA"?"selected":""}>FBA</option><option ${s.fulfillment==="FBM"?"selected":""}>FBM</option></select></div>
+        <div class="field"><label>运输方式</label><select name="modeId">${METHOD_CATALOG.map(m=>`<option value="${m.id}" ${m.id==="sea_lcl"?"selected":""}>${esc(m.name)}</option>`).join("")}</select></div>
+        <div class="field"><label>报价含义</label><select name="basis"><option value="per_shipment" selected>每仓总价 / 包价</option><option value="per_cbm">每仓按方 / CBM</option><option value="per_kg">每仓按计费重 / kg</option><option value="wm">每仓 W/M 收费吨</option><option value="per_container">每仓按整柜</option><option value="per_carton">每仓按箱</option></select></div>
+        <div class="field"><label>币种</label><select name="currency"><option>CNY</option><option>USD</option><option>GBP</option></select></div>
+      </div></div>
+      <div class="form-section"><h3><span>2</span>仓点、货量与报价</h3><div class="bulk-help"><b>每行填写：</b>仓点, 箱数, 件数, 该仓报价<br><small>仓点数量不限；例如每仓总价为 3,500 元时写 3500。若选择“按方”，则最后一列填写每方单价。</small></div><div class="field"><textarea class="split-rows" required name="rows" placeholder="ONT8, 10, 240, 3500\nABE8, 6, 144, 2800">${esc(rows)}</textarea></div></div>
+      <div class="form-section"><h3><span>3</span>时效与有效期</h3><div class="field-grid cols-3">
+        ${dialogField("最快时效","transitMin",20,"天")}${dialogField("最慢时效","transitMax",30,"天")}<div class="field"><label>报价有效至</label><input type="date" name="validUntil" value="${todayPlus(30)}"></div>
+        <div class="field full"><label>备注</label><textarea name="note" placeholder="例如：每仓报价已含清关与派送；不含查验费">各仓点分别报价，系统按仓点计算后相加</textarea></div>
+      </div></div>
+      <div class="form-actions"><button type="button" class="ghost" data-action="close-dialog">取消</button><button class="primary" value="default">保存并计算分仓总费用</button></div></form>`;
+  }
+
   function openShipment() { const d=document.getElementById("shipmentDialog"); d.innerHTML=shipmentDialogHtml(); d.showModal(); }
   function openQuote(id) { const d=document.getElementById("quoteDialog"); d.innerHTML=quoteDialogHtml(id?state.quotes.find(q=>q.id===id):null); d.showModal(); }
+  function openSplitQuote() { const d=document.getElementById("splitQuoteDialog"); d.innerHTML=splitQuoteDialogHtml(); d.showModal(); }
   function closeDialogs() { document.querySelectorAll("dialog[open]").forEach(d=>d.close()); }
 
   function formObject(form) { return Object.fromEntries(new FormData(form).entries()); }
@@ -354,7 +422,17 @@
   function submitShipment(form) {
     const o = formObject(form);
     numericFields(o,["quantity","unitsPerCarton","cartonCount","length","width","height","cartonWeight","declaredUnitValue","dutyRate","vatRate","insurancePct","inboundPlacementFee","awdMonths"]);
-    o.includeTaxes = o.includeTaxes === "true"; o.useAwd = form.elements.useAwd.checked;
+    o.includeTaxes = o.includeTaxes === "true"; o.useAwd = form.elements.useAwd.checked; o.splitEnabled = form.elements.splitEnabled.checked;
+    const parsedSplits = String(o.splitText || "").split(/\r?\n/).map(line => {
+      const parts = line.trim().split(/[,，\s]+/); return { warehouse: String(parts[0] || "").toUpperCase(), cartonCount: num(parts[1]), quantity: num(parts[2]) };
+    }).filter(x => x.warehouse && x.cartonCount > 0 && x.quantity > 0);
+    delete o.splitText;
+    if (o.splitEnabled && parsedSplits.length >= 2) {
+      o.splits = parsedSplits; o.warehouse = parsedSplits[0].warehouse;
+      o.cartonCount = parsedSplits.reduce((t,x)=>t+x.cartonCount,0); o.quantity = parsedSplits.reduce((t,x)=>t+x.quantity,0);
+    } else {
+      o.splitEnabled = false; o.splits = [{ warehouse: o.warehouse.toUpperCase(), cartonCount: o.cartonCount, quantity: o.quantity }];
+    }
     if (o.market !== state.shipment.market) {
       const d = MARKET[o.market]; o.dutyRate = d.duty; o.vatRate = d.vat;
     }
@@ -369,8 +447,44 @@
     save(); closeDialogs(); toast(idx>=0?"报价已更新":"报价已加入动态报价库"); render();
   }
 
+  function parseSplitQuoteRows(text) {
+    return String(text || "").split(/\r?\n/).map((line, index) => {
+      const parts = line.trim().split(/[,，\t]+/).map(x => x.trim());
+      return { line: index + 1, warehouse: String(parts[0] || "").toUpperCase(), cartonCount: num(parts[1]), quantity: num(parts[2]), rate: num(String(parts[3] || "").replace(/[^\d.-]/g, "")) };
+    }).filter(x => x.warehouse || x.cartonCount || x.quantity || x.rate);
+  }
+
+  function submitSplitQuote(form) {
+    const o = formObject(form);
+    numericFields(o,["transitMin","transitMax"]);
+    const rows = parseSplitQuoteRows(o.rows);
+    if (rows.length < 2 || rows.some(x => !x.warehouse || x.cartonCount <= 0 || x.quantity <= 0 || x.rate <= 0)) {
+      toast("请至少填写 2 个仓点，并确保每行的仓点、箱数、件数和报价都有效");
+      return;
+    }
+    const group = "split-" + uid();
+    const warehouses = new Set(rows.map(x => x.warehouse));
+    state.quotes = state.quotes.filter(q => q.demo || !(q.carrier === o.carrier.trim() && q.market === o.market && q.fulfillment === o.fulfillment && q.modeId === o.modeId && warehouses.has(q.warehouse)));
+    rows.forEach(x => state.quotes.unshift({
+      id:uid(), quoteGroup:group, carrier:o.carrier.trim(), warehouse:x.warehouse, market:o.market, fulfillment:o.fulfillment,
+      modeId:o.modeId, basis:o.basis, rate:x.rate, currency:o.currency, minCharge:0, originFee:0, exportFee:0, docFee:0,
+      destFee:0, deliveryFee:0, surchargePct:0, transitMin:o.transitMin, transitMax:o.transitMax,
+      validUntil:o.validUntil, note:o.note, demo:false, enabled:true
+    }));
+    const splits = rows.map(x => ({warehouse:x.warehouse, cartonCount:x.cartonCount, quantity:x.quantity}));
+    const marketDefaults = o.market !== state.shipment.market ? { dutyRate:MARKET[o.market].duty, vatRate:MARKET[o.market].vat } : {};
+    state.shipment = {
+      ...state.shipment, market:o.market, fulfillment:o.fulfillment, splitEnabled:true, splits, warehouse:splits[0].warehouse,
+      cartonCount:splits.reduce((t,x)=>t+x.cartonCount,0), quantity:splits.reduce((t,x)=>t+x.quantity,0), ...marketDefaults
+    };
+    state.page="agent"; save(); closeDialogs(); render();
+    const result = results().find(r => r.q.quoteGroup === group) || results().find(r => r.q.carrier === o.carrier.trim());
+    toast(result ? `${rows.length} 个仓点已合计：${money(result.total)}` : `${rows.length} 个仓点报价已保存`);
+  }
+
   function parseChat(text) {
     const s = { ...state.shipment }; const changes=[]; let quoteCount=0;
+    const hasQuoteIntent = /报价|元\s*\/(?:方|kg|公斤|柜|票)|美元\s*\//i.test(text);
     if (/美国|美站|\bUS\b/i.test(text)) { s.market="US"; s.dutyRate=5; s.vatRate=0; changes.push("目的站点：美国"); }
     if (/英国|英站|\bUK\b/i.test(text)) { s.market="UK"; s.dutyRate=4; s.vatRate=20; changes.push("目的站点：英国"); }
     if (/\bFBA\b/i.test(text)) { s.fulfillment="FBA"; changes.push("履约：FBA"); }
@@ -385,29 +499,37 @@
     if(qty){ s.quantity=num(qty[1]);changes.push(`件数：${s.quantity}`); }
     const origin=text.match(/(?:从|起运地|产地)[：:\s]*([\u4e00-\u9fa5]{2,6})(?:发|出|到|至|，|,|\s)/);
     if(origin){ s.origin=origin[1];changes.push(`起运地：${s.origin}`); }
-    const codes=[...text.toUpperCase().matchAll(/\b([A-Z]{3,4}\d)\b/g)].map(x=>x[1]).filter(x=>!["FBA","FBM"].includes(x));
-    if(codes.length){ s.warehouse=codes[0];changes.push(`当前目的仓：${s.warehouse}`); }
+    const codes=[...new Set([...text.toUpperCase().matchAll(/\b([A-Z]{3,4}\d)\b/g)].map(x=>x[1]).filter(x=>!["FBA","FBM"].includes(x)))];
+    const splitMatches=[...text.matchAll(/\b([A-Z]{3,4}\d)\b[^\d]{0,10}(\d+)\s*箱(?:[^\d]{0,10}(\d+)\s*件)?/gi)];
+    const chatSplits=splitMatches.map(x=>({warehouse:x[1].toUpperCase(),cartonCount:num(x[2]),quantity:num(x[3])})).filter(x=>x.cartonCount>0 && x.quantity>0);
+    if(chatSplits.length>=2 && (/分仓|拆分|分别|不同仓/.test(text) || !hasQuoteIntent)){
+      s.splitEnabled=true;s.splits=chatSplits;s.warehouse=chatSplits[0].warehouse;
+      s.cartonCount=chatSplits.reduce((t,x)=>t+x.cartonCount,0);s.quantity=chatSplits.reduce((t,x)=>t+x.quantity,0);
+      changes.push(`分仓：${chatSplits.map(x=>`${x.warehouse} ${x.cartonCount}箱/${x.quantity}件`).join("；")}`);
+    } else if(codes.length && !hasQuoteIntent){ s.splitEnabled=false;s.warehouse=codes[0];s.splits=[{warehouse:s.warehouse,cartonCount:s.cartonCount,quantity:s.quantity}];changes.push(`当前目的仓：${s.warehouse}`); }
 
     const carrierMatch=text.match(/(?:添加报价|报价|承运商)[：:\s]*([^\s,，:：]+(?:物流|供应链|国际|货代)?)/);
     const carrier=carrierMatch?carrierMatch[1]:"对话录入承运商";
-    if(/报价|元\s*\/(?:方|kg|公斤|柜|票)|美元\s*\//i.test(text) && codes.length){
+    if(hasQuoteIntent && codes.length){
+      const quoteGroup = codes.length > 1 ? "chat-" + uid() : "";
       codes.forEach((code, index) => {
         const start=text.toUpperCase().indexOf(code); const segment=text.slice(start, index+1<codes.length?text.toUpperCase().indexOf(codes[index+1]):undefined);
-        const rateMatch=segment.match(/(\d+(?:\.\d+)?)\s*(元|人民币|美元|美金|英镑)?\s*\/(方|CBM|KG|公斤|柜|票)/i);
+        const rateMatch=segment.match(/(\d+(?:\.\d+)?)\s*(元|人民币|美元|美金|英镑)?\s*\/(方|CBM|KG|公斤|柜|票)/i)
+          || segment.match(/(?:报价|总价|包价)[：:\s]*(\d+(?:\.\d+)?)\s*(元|人民币|美元|美金|英镑)?/i);
         if(!rateMatch) return;
-        const unit=rateMatch[3].toLowerCase();
+        const unit=(rateMatch[3] || "票").toLowerCase();
         const basis=/方|cbm/.test(unit)?"per_cbm":/kg|公斤/.test(unit)?"per_kg":/柜/.test(unit)?"per_container":"per_shipment";
         const currency=/美元|美金/.test(rateMatch[2]||"")?"USD":/英镑/.test(rateMatch[2]||"")?"GBP":"CNY";
         const days=segment.match(/(\d+)\s*[-~至到]\s*(\d+)\s*天/) || text.match(/(\d+)\s*[-~至到]\s*(\d+)\s*天/);
         const modeId=/空运/.test(text)?"air":/快递/.test(text)?"express":/整柜|FCL/i.test(text)?"sea_fcl":/SEND/i.test(text)?"send_ocean":/AGL/i.test(text)?"agl_lcl":/铁路|班列/.test(text)?"rail":"sea_lcl";
-        state.quotes.unshift({id:uid(),carrier,warehouse:code,market:s.market,fulfillment:s.fulfillment,modeId,basis,rate:num(rateMatch[1]),currency,minCharge:0,originFee:0,exportFee:0,docFee:0,destFee:0,deliveryFee:0,surchargePct:0,transitMin:days?num(days[1]):20,transitMax:days?num(days[2]):30,validUntil:todayPlus(30),note:"通过对话录入，请补充固定费与报价范围",demo:false,enabled:true}); quoteCount++;
+        state.quotes.unshift({id:uid(),quoteGroup,carrier,warehouse:code,market:s.market,fulfillment:s.fulfillment,modeId,basis,rate:num(rateMatch[1]),currency,minCharge:0,originFee:0,exportFee:0,docFee:0,destFee:0,deliveryFee:0,surchargePct:0,transitMin:days?num(days[1]):20,transitMax:days?num(days[2]):30,validUntil:todayPlus(30),note:"通过对话录入，请补充固定费与报价范围",demo:false,enabled:true}); quoteCount++;
       });
     }
     state.shipment=s;
     const r=results()[0];
     let response="";
     if(changes.length) response += "已更新：\n• "+changes.join("\n• ")+"\n\n";
-    if(quoteCount) response += `已识别并新增 ${quoteCount} 条仓点报价。固定费用暂按 0 计算，建议到“动态报价库”补充报关、清关和派送费。\n\n`;
+    if(quoteCount) response += `已识别并新增 ${quoteCount} 条仓点报价。${s.splitEnabled&&activeSplits().length>1?"同一方案会逐仓计算，并将各仓费用相加为整批总费用。":"固定费用暂按 0 计算，可到“动态报价库”补充。"}\n\n`;
     if(/比较|测算|多少钱|费用|方案/.test(text) || changes.length || quoteCount) {
       const mm=shipmentMetrics(); response += `货件换算：${fmt(mm.cbm,3)} CBM，实重 ${fmt(mm.actualKg,1)} kg，空运计费重 ${fmt(mm.chargeKg,1)} kg。`;
       response += r ? `\n当前最低方案为「${r.q.carrier}」，估算总成本 ${money(r.total)}，约 ${money(r.perUnit,"CNY",2)}/件，时效 ${fmt(r.days,0)} 天。` : "\n当前没有匹配且单价有效的报价，请继续提供承运商报价。";
@@ -442,6 +564,7 @@
     const action=el.dataset.action;
     if(action==="open-shipment")openShipment();
     if(action==="open-quote")openQuote();
+    if(action==="open-split-quote")openSplitQuote();
     if(action==="edit-quote")openQuote(el.dataset.id);
     if(action==="close-dialog")closeDialogs();
     if(action==="clear-chat"){state.messages=defaultState().messages;save();render();}
@@ -459,6 +582,7 @@
     if(e.target.id==="chatForm")sendChat(document.getElementById("chatInput").value);
     if(e.target.id==="shipmentForm")submitShipment(e.target);
     if(e.target.id==="quoteForm")submitQuote(e.target);
+    if(e.target.id==="splitQuoteForm")submitSplitQuote(e.target);
     if(e.target.id==="settingsForm"){
       const o=formObject(e.target);numericFields(o,["usdCny","gbpCny","airDivisor","expressDivisor","fclUtilization","dutyRate","vatRate","insurancePct","inboundPlacementFee","awdInboundPerBox","awdTransportBase","awdTransportManaged","awdStorageWestBase","awdStorageWestSmart","awdStorageWestManaged","awdStorageOtherBase","awdStorageOtherSmart","awdStorageOtherManaged"]);
       state.settings={...state.settings,usdCny:o.usdCny,gbpCny:o.gbpCny,airDivisor:o.airDivisor,expressDivisor:o.expressDivisor,fclUtilization:o.fclUtilization,awdInboundPerBox:o.awdInboundPerBox,awdTransportBase:o.awdTransportBase,awdTransportManaged:o.awdTransportManaged,awdStorageWestBase:o.awdStorageWestBase,awdStorageWestSmart:o.awdStorageWestSmart,awdStorageWestManaged:o.awdStorageWestManaged,awdStorageOtherBase:o.awdStorageOtherBase,awdStorageOtherSmart:o.awdStorageOtherSmart,awdStorageOtherManaged:o.awdStorageOtherManaged};

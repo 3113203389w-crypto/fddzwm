@@ -122,6 +122,15 @@ button { border: 0; }
 .breakdown { margin-top: 14px; border-top: 1px dashed #d9e2dd; padding-top: 12px; display: grid; grid-template-columns: repeat(4,1fr); gap: 8px; }
 .breakdown span { color: var(--muted); font-size: 10px; }
 .breakdown b { display: block; margin-top: 2px; font-size: 12px; }
+.split-breakdown { margin-top: 14px; padding: 12px 13px; border: 1px solid #d8e7e0; border-radius: 11px; background: #f8fbf9; }
+.split-breakdown > b { display: block; margin-bottom: 7px; color: var(--green-dark); font-size: 11px; }
+.split-breakdown > div { display: flex; justify-content: space-between; gap: 16px; padding: 7px 0; border-top: 1px dashed #dce5e1; font-size: 11px; }
+.split-breakdown > div span { color: var(--muted); }
+.split-breakdown small { margin-left: 25px; color: #789086; }
+.split-index { display: inline-grid; place-items: center; width: 18px; height: 18px; margin-right: 7px; border-radius: 6px; color: white; background: var(--green); font-size: 9px; font-style: normal; }
+.split-breakdown .split-formula { justify-content: flex-end; flex-wrap: wrap; color: #557067; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+.split-breakdown .split-total { margin-top: 3px; padding-top: 9px; }
+.split-breakdown .split-total span, .split-breakdown .split-total strong { color: var(--ink); font-size: 12px; }
 
 .empty-state { padding: 48px 20px; text-align: center; color: var(--muted); }
 .empty-state .empty-icon { font-size: 34px; margin-bottom: 8px; }
@@ -184,6 +193,17 @@ tbody tr:hover { background: #fbfdfc; }
 .form-section:last-child { border-bottom:0; }
 .form-section h3 { margin:0 0 12px; font-size:14px; }
 .form-section h3 span { display:inline-grid; place-items:center; width:21px; height:21px; margin-right:7px; border-radius:7px; color:white; background:var(--green); font-size:10px; }
+.split-editor { margin-top: 13px; padding: 13px; border: 1px solid #cfe0d8; border-radius: 11px; background: #f5faf7; }
+.split-editor > label { display: flex; align-items: center; gap: 8px; color: var(--green-dark); font-size: 12px; font-weight: 650; }
+.split-editor > label input { width: auto; min-height: auto; }
+.split-editor .field { margin-top: 10px; }
+.split-editor textarea { min-height: 88px; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+.split-action { color: var(--green-dark); border-color: #b8d7ca; background: #f2faf6; }
+.split-banner { margin: 16px 20px 0; padding: 13px 15px; display: flex; align-items: center; justify-content: space-between; gap: 16px; border: 1px solid #b9ddcd; border-radius: 11px; color: var(--green-dark); background: linear-gradient(135deg,#effaf5,#f8fcfa); font-size: 13px; }
+.split-banner strong { font-size: 12px; letter-spacing: .04em; text-transform: uppercase; }
+.bulk-help { margin-bottom: 10px; padding: 11px 13px; border-radius: 9px; color: #38544a; background: #f4f7f6; font-size: 12px; line-height: 1.6; }
+.bulk-help small { color: var(--muted); }
+.split-rows { min-height: 145px; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; line-height: 1.7; }
 .form-actions { padding: 15px 20px; display:flex; justify-content:flex-end; gap:8px; background:#fafbfa; }
 
 .modal { width: min(720px, calc(100vw - 32px)); max-height: calc(100vh - 40px); padding: 0; overflow: auto; border: 0; border-radius: 18px; box-shadow: 0 25px 90px rgba(13,35,27,.25); }
@@ -191,6 +211,13 @@ tbody tr:hover { background: #fbfdfc; }
 .modal::backdrop { background: rgba(16,34,28,.48); backdrop-filter: blur(3px); }
 .modal-head { position: sticky; top:0; z-index:2; padding:17px 20px; display:flex; justify-content:space-between; align-items:center; background:white; border-bottom:1px solid var(--line); }
 .modal-head h2 { margin:0; font-size:17px; }
+.modal-head p { margin: 3px 0 0; color: var(--muted); font-size: 11px; }
+
+@media (max-width: 640px) {
+  .split-banner { align-items: flex-start; flex-direction: column; gap: 4px; }
+  .split-breakdown > div { align-items: flex-start; }
+  .split-breakdown > div > strong { white-space: nowrap; }
+}
 
 .about-hero { padding: 25px; display:grid; grid-template-columns:1.25fr .75fr; gap:24px; background:linear-gradient(135deg,#0a664d,#0b7d5d); color:white; border-radius:var(--radius); overflow:hidden; }
 .about-hero h2 { margin:0 0 8px; font-size:24px; }
