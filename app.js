@@ -132,7 +132,7 @@
       const response = await fetch("https://open.er-api.com/v6/latest/CNY", { cache:"no-store" });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const data = await response.json();
-      if (data.result !== "success" || data.base_code !== "CNY" || num(data.time_eol_unix) > 0) throw new Error("汇率接口状态异常");
+      if (data.result !== "success" || data.base_code !== "CNY" || (num(data.time_eol_unix) > 0 && num(data.time_eol_unix) * 1000 <= Date.now())) throw new Error("汇率接口状态异常");
       const usd = 1 / num(data.rates && data.rates.USD), gbp = 1 / num(data.rates && data.rates.GBP);
       if (!Number.isFinite(usd) || !Number.isFinite(gbp) || usd <= 0 || gbp <= 0) throw new Error("汇率数据无效");
       state.settings.usdCny = Number(usd.toFixed(4)); state.settings.gbpCny = Number(gbp.toFixed(4));
