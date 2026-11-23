@@ -15,6 +15,13 @@
     US: { label: "美国站", flag: "🇺🇸", currency: "USD", duty: 0, vat: 0 },
     UK: { label: "英国站", flag: "🇬🇧", currency: "GBP", duty: 0, vat: 20 }
   };
+  const AWD_2027_DATE = "2027-02-01";
+  const AWD_AGED_DATE = "2027-03-01";
+  const AWD_2027 = {
+    inbound: 1.55, palletCarton: 1.16, palletTemplate: 0.93,
+    outbound: 1.55, transport: 1.58,
+    agedStorage: { west: { base: 1.43, smart: 1.28, managed: 1.14 }, other: { base: 1.20, smart: 1.08, managed: 0.96 } }
+  };
 
   const METHOD_CATALOG = [
     { id: "send_air", icon: "✈", name: "Amazon SEND · 空运", owner: "Amazon", markets: "美国 / 英国", basis: "kg / 票", desc: "Seller Export & Delivery，承运商上门或送仓，含出口与目的国清关流程衔接。" },
@@ -51,7 +58,8 @@
         usdCny: 6.66, gbpCny: 8.91, autoFx: true, airDivisor: 6000, expressDivisor: 5000, fclUtilization: 90,
         awdInboundPerBox: 1.40, awdWestPalletInbound: 1.05, awdOutboundPerBox: 1.40, awdTransportBase: 1.40, awdTransportManaged: 1.26,
         awdStorageWestBase: 0.57, awdStorageWestSmart: 0.51, awdStorageWestManaged: 0.46,
-        awdStorageOtherBase: 0.48, awdStorageOtherSmart: 0.43, awdStorageOtherManaged: 0.38
+        awdStorageOtherBase: 0.48, awdStorageOtherSmart: 0.43, awdStorageOtherManaged: 0.38,
+        awdFuelSurchargePct: 3.5
       },
       shipment: {
         origin: "深圳", market: "US", fulfillment: "FBA", warehouse: "ONT8", quantity: 480,
@@ -59,7 +67,8 @@
         unitsPerCarton: 24, cartonCount: 20, length: 54, width: 40, height: 35, cartonWeight: 15.5,
         declaredUnitValue: 7.5, dutyRate: 0, vatRate: 0, insurancePct: 0.3,
         inboundPlacementFee: 0, includeTaxes: true, useAwd: false, awdRegion: "west",
-        awdTier: "base", awdMonths: 0.5, awdPalletizable: false, awdOutboundRatio: 100, containerType: "40HQ"
+        awdTier: "base", awdMonths: 0.5, awdPalletizable: false, awdPalletTemplate: false,
+        awdReceivedDate: "", awdOutboundRatio: 100, containerType: "40HQ"
       },
       quotes: [
         { id: "demo-us-lcl-ont8", carrier: "瀚海物流（演示）", warehouse: "ONT8", market: "US", fulfillment: "FBA", modeId: "sea_lcl", basis: "per_cbm", rate: 860, currency: "CNY", minCharge: 1800, originFee: 380, exportFee: 300, docFee: 180, destFee: 680, deliveryFee: 420, surchargePct: 3, transitMin: 24, transitMax: 31, validUntil: todayPlus(30), note: "演示价，含海运干线；不代表实时市场报价", demo: true, enabled: true },
@@ -123,6 +132,7 @@
       const response = await fetch("https://open.er-api.com/v6/latest/CNY", { cache:"no-store" });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const data = await response.json();
+      if (data.result !== "success" || data.base_code !== "CNY" || num(data.time_eol_unix) > 0) throw new Error("汇率接口状态异常");
       const usd = 1 / num(data.rates && data.rates.USD), gbp = 1 / num(data.rates && data.rates.GBP);
       if (!Number.isFinite(usd) || !Number.isFinite(gbp) || usd <= 0 || gbp <= 0) throw new Error("汇率数据无效");
       state.settings.usdCny = Number(usd.toFixed(4)); state.settings.gbpCny = Number(gbp.toFixed(4));
@@ -130,7 +140,7 @@
       save(); render(); if (notify) toast(`汇率已更新：USD ${state.settings.usdCny} · GBP ${state.settings.gbpCny}`);
     } catch (error) {
       state.fxMeta = { ...(state.fxMeta || {}), status:"error", fetchedAt:new Date().toISOString(), message:`刷新失败：${error.message}` };
-      save(); render(); if (notify) toast("实时汇率获取失败，已保留上次成功值");
+      save(); render(); if (notify) toast("参考汇率获取失败，已保留上次成功值");
     } finally { fxLoading = false; }
   }
   function warehouseMatch(q, warehouse) { return q.warehouse === "*" || q.warehouse.toUpperCase() === String(warehouse || state.shipment.warehouse).toUpperCase(); }
@@ -150,6 +160,17 @@
     const divisor = q && q.modeId === "express" ? state.settings.expressDivisor : state.settings.airDivisor;
     const volumeKg = s.length * s.width * s.height / divisor * cartonCount;
     return { cbm, cuft: cbm * 35.3147, actualKg, volumeKg, chargeKg: Math.max(actualKg, volumeKg), wm: Math.max(cbm, actualKg / 1000), cartonCount, quantity };
+  }
+
+  function awdStorageUsd(cuft, months, receivedDate, standardRate, agedRate) {
+    const start = new Date(`${receivedDate}T00:00:00Z`);
+    let total = 0;
+    for (let month = 0; month < Math.ceil(Math.max(0, months)); month++) {
+      const billedMonth = new Date(Date.UTC(start.getUTCFullYear(), start.getUTCMonth() + month, 1)).toISOString().slice(0, 10);
+      const rate = month >= 12 && billedMonth >= AWD_AGED_DATE ? agedRate : standardRate;
+      total += cuft * rate * Math.min(1, months - month);
+    }
+    return total;
   }
 
   function computeQuote(q, allocation) {
@@ -178,15 +199,25 @@
     const vatBase = s.market === "UK" ? customsBase + duty + destination : customsBase + duty;
     const vat = s.includeTaxes ? vatBase * num(s.vatRate) / 100 : 0;
     const placement = num(s.inboundPlacementFee) * fx(localCurrency()) * (m.quantity / Math.max(1, s.quantity));
-    let amazon = placement;
-    if (s.useAwd && s.market === "US") {
-      const transportRate = s.awdTier === "managed" ? state.settings.awdTransportManaged : state.settings.awdTransportBase;
+    const usesAwd = s.useAwd && s.market === "US" && s.fulfillment === "FBA";
+    let amazon = s.fulfillment === "FBA" && !usesAwd ? placement : 0;
+    if (usesAwd) {
+      const receivedDate = /^\d{4}-\d{2}-\d{2}$/.test(s.awdReceivedDate || "") ? s.awdReceivedDate : new Date().toISOString().slice(0, 10);
+      const futureRates = receivedDate >= AWD_2027_DATE;
+      const transportRate = futureRates ? AWD_2027.transport : s.awdTier === "managed" ? state.settings.awdTransportManaged : state.settings.awdTransportBase;
       const storageRate = s.awdRegion === "west"
         ? (s.awdTier === "managed" ? state.settings.awdStorageWestManaged : s.awdTier === "smart" ? state.settings.awdStorageWestSmart : state.settings.awdStorageWestBase)
         : (s.awdTier === "managed" ? state.settings.awdStorageOtherManaged : s.awdTier === "smart" ? state.settings.awdStorageOtherSmart : state.settings.awdStorageOtherBase);
-      const inboundRate = s.awdRegion === "west" && s.awdPalletizable ? state.settings.awdWestPalletInbound : state.settings.awdInboundPerBox;
+      const agedRate = AWD_2027.agedStorage[s.awdRegion === "west" ? "west" : "other"][s.awdTier] || AWD_2027.agedStorage.west.base;
+      const inboundRate = futureRates
+        ? s.awdRegion === "west" && s.awdPalletizable ? (s.awdPalletTemplate ? AWD_2027.palletTemplate : AWD_2027.palletCarton) : AWD_2027.inbound
+        : s.awdRegion === "west" && s.awdPalletizable ? state.settings.awdWestPalletInbound : state.settings.awdInboundPerBox;
+      const outboundRate = futureRates ? AWD_2027.outbound : state.settings.awdOutboundPerBox;
       const outboundBoxes = m.cartonCount * Math.min(100, Math.max(0, num(s.awdOutboundRatio,100))) / 100;
-      amazon += (m.cartonCount * inboundRate + outboundBoxes * state.settings.awdOutboundPerBox + m.cuft * transportRate + m.cuft * storageRate * num(s.awdMonths)) * state.settings.usdCny;
+      const transport = m.cuft * transportRate;
+      const fuelSurcharge = futureRates ? transport * num(state.settings.awdFuelSurchargePct) / 100 : 0;
+      const storage = awdStorageUsd(m.cuft, num(s.awdMonths), receivedDate, storageRate, agedRate);
+      amazon += (m.cartonCount * inboundRate + outboundBoxes * outboundRate + transport + fuelSurcharge + storage) * state.settings.usdCny;
     }
     const total = freight + origin + destination + surcharge + insurance + duty + vat + amazon;
     const days = (num(q.transitMin) + num(q.transitMax)) / 2 || 99;
@@ -260,7 +291,7 @@
 
   function renderAgent() {
     const s = state.shipment, m = shipmentMetrics(), splits = activeSplits(), routeLabel = warehouseLabel(), list = results(), best = list[0];
-    return `<div class="data-freshness"><div><i class="fresh-dot ${state.fxMeta && state.fxMeta.status}"></i><b>参考汇率</b><span>USD/CNY ${fmt(state.settings.usdCny,4)} · GBP/CNY ${fmt(state.settings.gbpCny,4)} · ${esc(fxTimeLabel())}</span></div><div><b>AWD 官方基线</b><span>已核验 2026-11-02</span></div><div class="manual"><b>关税</b><span>必须按 HS / Commodity Code 填写</span></div><button class="ghost mini" data-action="refresh-fx">立即刷新</button></div><div class="agent-grid">
+    return `<div class="data-freshness"><div><i class="fresh-dot ${state.fxMeta && state.fxMeta.status}"></i><b>参考汇率</b><span>USD/CNY ${fmt(state.settings.usdCny,4)} · GBP/CNY ${fmt(state.settings.gbpCny,4)} · ${esc(fxTimeLabel())} · <a href="https://www.exchangerate-api.com" target="_blank" rel="noreferrer">Rates By Exchange Rate API</a></span></div><div><b>AWD 官方基线</b><span>已核验 2026-11-23 · 2027-02 起有新费率</span></div><div class="manual"><b>关税</b><span>必须按 HS / Commodity Code 填写</span></div><button class="ghost mini" data-action="refresh-fx">立即刷新</button></div><div class="agent-grid">
       <section class="panel chat-panel">
         <div class="panel-head"><div><h2>对话式费用 Agent</h2><p>自然语言录入货件、仓点与承运商报价</p></div><button class="ghost mini" data-action="clear-chat">清空</button></div>
         <div class="chat-thread">${state.messages.map(msg => `<div class="message ${msg.role}">${esc(msg.text)}<small>${esc(msg.time || "")}</small></div>`).join("")}</div>
@@ -337,7 +368,7 @@
   function renderSettings() {
     const x = state.settings, s = state.shipment;
     return `<form id="settingsForm" class="settings-grid">
-      <section class="panel"><div class="panel-head"><div><h2>实时汇率与换算</h2><p>${esc(state.fxMeta && state.fxMeta.source || "参考汇率")} · ${esc(state.fxMeta && state.fxMeta.message || "")}</p></div><button type="button" class="ghost mini" data-action="refresh-fx">立即刷新</button></div><div class="panel-body field-grid">
+      <section class="panel"><div class="panel-head"><div><h2>每日参考汇率与换算</h2><p>${esc(state.fxMeta && state.fxMeta.source || "参考汇率")} · ${esc(state.fxMeta && state.fxMeta.message || "")} · <a href="https://www.exchangerate-api.com" target="_blank" rel="noreferrer">Rates By Exchange Rate API</a></p></div><button type="button" class="ghost mini" data-action="refresh-fx">立即刷新</button></div><div class="panel-body field-grid">
         ${field("美元兑人民币","usdCny",x.usdCny,"number","", "0.01")}${field("英镑兑人民币","gbpCny",x.gbpCny,"number","", "0.01")}
         ${field("空运体积系数","airDivisor",x.airDivisor,"number","cm³/kg")}${field("快递体积系数","expressDivisor",x.expressDivisor,"number","cm³/kg")}
         ${field("整柜可用率","fclUtilization",x.fclUtilization,"number","%")}
@@ -348,11 +379,13 @@
         ${field("保险费率","insurancePct",s.insurancePct,"number","%","0.01")}${field("FBA 入库配置费","inboundPlacementFee",s.inboundPlacementFee,"number",localCurrency(),"0.01")}
         <div class="field full"><label><input style="width:auto;min-height:auto" type="checkbox" name="includeTaxes" ${s.includeTaxes?"checked":""}> 在总成本中计入估算关税与进口税</label><small>美国关税按申报交易价值估算，不再把国际运费和保险计入；英国按海关价值、关税及已知目的地费用估算 VAT。</small></div>
       </div></section>
-      <section class="panel" style="grid-column:1/-1"><div class="panel-head"><div><h2>AWD 官方费率基线 <span class="tag amazon">USD</span></h2><p>Amazon 官方公开费率（核对日期：2026-11-02）；入库与出库处理分别计费</p></div><a class="ghost mini source-link" href="https://sell.amazon.com/programs/warehousing" target="_blank" rel="noreferrer">官方来源 ↗</a></div><div class="panel-body field-grid cols-3">
+      <section class="panel" style="grid-column:1/-1"><div class="panel-head"><div><h2>AWD 官方费率基线 <span class="tag amazon">USD</span></h2><p>2026-11-23 核验；以下可调费率适用至 2027-01-31，到仓日期自 2027-02-01 起按新费率计算。经 AWD 补货至 FBA 不再叠加入库配置费。</p></div><a class="ghost mini source-link" href="https://sellercentral.amazon.com/help/hub/reference/external/GAYG62Q3MPE6STFS" target="_blank" rel="noreferrer">官方费率 ↗</a></div><div class="panel-body field-grid cols-3">
         ${field("普通入库处理 / 箱","awdInboundPerBox",x.awdInboundPerBox,"number","USD","0.01")}${field("美西托盘促销入库 / 箱","awdWestPalletInbound",x.awdWestPalletInbound,"number","USD","0.01")}${field("出库处理 / 箱","awdOutboundPerBox",x.awdOutboundPerBox,"number","USD","0.01")}
         ${field("运输 / cu ft","awdTransportBase",x.awdTransportBase,"number","USD","0.01")}${field("Managed 运输 / cu ft","awdTransportManaged",x.awdTransportManaged,"number","USD","0.01")}
         ${field("美西基础仓储 / cu ft/月","awdStorageWestBase",x.awdStorageWestBase,"number","USD","0.01")}${field("美西 Smart 仓储","awdStorageWestSmart",x.awdStorageWestSmart,"number","USD","0.01")}${field("美西 Managed 仓储","awdStorageWestManaged",x.awdStorageWestManaged,"number","USD","0.01")}
         ${field("其他区域基础仓储","awdStorageOtherBase",x.awdStorageOtherBase,"number","USD","0.01")}${field("其他区域 Smart 仓储","awdStorageOtherSmart",x.awdStorageOtherSmart,"number","USD","0.01")}${field("其他区域 Managed 仓储","awdStorageOtherManaged",x.awdStorageOtherManaged,"number","USD","0.01")}
+        ${field("2027-02 起 AWD 燃油物流附加","awdFuelSurchargePct",x.awdFuelSurchargePct,"number","%","0.01")}
+        <div class="field full"><small>2027-02-01 起：普通入库与出库 $1.55/箱；美西合格散箱 $1.16/箱、整托 $0.93/箱；运输 $1.58/cu ft，附加费按实际公布比例调整。2027-03-01 起超过 12 个月的库存采用高龄仓储费。</small></div>
       </div></section>
       <section class="panel" style="grid-column:1/-1"><div class="panel-head"><div><h2>数据管理</h2><p>报价与设置仅保存在当前浏览器，可导出备份</p></div></div><div class="panel-body"><div class="toolbar-group"><button type="submit" class="primary">保存参数</button><button type="button" class="ghost" data-action="export">导出完整 JSON</button><button type="button" class="ghost" data-action="import">导入备份</button><button type="button" class="danger" data-action="reset">恢复演示数据</button></div></div></section>
     </form>`;
@@ -401,7 +434,9 @@
         <div class="field"><label>AWD 区域</label><select name="awdRegion"><option value="west" ${s.awdRegion==="west"?"selected":""}>美西</option><option value="other" ${s.awdRegion==="other"?"selected":""}>美东/南部</option></select></div>
         <div class="field"><label>AWD 费率层级</label><select name="awdTier"><option value="base" ${s.awdTier==="base"?"selected":""}>基础</option><option value="smart" ${s.awdTier==="smart"?"selected":""}>Smart Storage</option><option value="managed" ${s.awdTier==="managed"?"selected":""}>Amazon Managed</option></select></div>
         ${dialogField("预计 AWD 存储","awdMonths",s.awdMonths,"月")}${dialogField("预计补货出库比例","awdOutboundRatio",s.awdOutboundRatio,"%")}
-        <div class="field full"><label><input type="checkbox" style="width:auto;min-height:auto" name="awdPalletizable" ${s.awdPalletizable?"checked":""}> 符合美西 Palletizable 区域促销入库条件（当前公开优惠至 2026-12-31）</label></div>
+        <div class="field"><label>预计 AWD 到仓日期</label><input type="date" name="awdReceivedDate" value="${esc(s.awdReceivedDate || new Date().toISOString().slice(0,10))}"></div>
+        <div class="field full"><label><input type="checkbox" style="width:auto;min-height:auto" name="awdPalletizable" ${s.awdPalletizable?"checked":""}> 符合美西 Palletizable 区域单 ASIN 促销条件</label><small>2027-01-31 前按符合条件时 $1.05/箱估算；2027-02-01 起散箱 $1.16/箱。</small></div>
+        <div class="field full"><label><input type="checkbox" style="width:auto;min-height:auto" name="awdPalletTemplate" ${s.awdPalletTemplate?"checked":""}> 2027-02-01 起使用单 ASIN 整托模板（优惠入库 $0.93/箱）</label><small>仅适用于符合 Amazon 促销条件的美西托盘仓。最终资格以 Seller Central 为准。</small></div>
       </div></div>
       <div class="form-actions"><button type="button" class="ghost" data-action="close-dialog">取消</button><button class="primary" value="default">保存并测算</button></div></form>`;
   }
@@ -465,7 +500,7 @@
   function submitShipment(form) {
     const o = formObject(form);
     numericFields(o,["quantity","unitsPerCarton","cartonCount","length","width","height","cartonWeight","declaredUnitValue","dutyRate","vatRate","insurancePct","inboundPlacementFee","awdMonths","awdOutboundRatio"]);
-    o.includeTaxes = o.includeTaxes === "true"; o.useAwd = form.elements.useAwd.checked; o.awdPalletizable = form.elements.awdPalletizable.checked; o.splitEnabled = form.elements.splitEnabled.checked;
+    o.includeTaxes = o.includeTaxes === "true"; o.useAwd = form.elements.useAwd.checked; o.awdPalletTemplate = form.elements.awdPalletTemplate.checked; o.awdPalletizable = form.elements.awdPalletizable.checked || o.awdPalletTemplate; o.splitEnabled = form.elements.splitEnabled.checked;
     const parsedSplits = String(o.splitText || "").split(/\r?\n/).map(line => {
       const parts = line.trim().split(/[,，\s]+/); return { warehouse: String(parts[0] || "").toUpperCase(), cartonCount: num(parts[1]), quantity: num(parts[2]) };
     }).filter(x => x.warehouse && x.cartonCount > 0 && x.quantity > 0);
@@ -628,8 +663,8 @@
     if(e.target.id==="quoteForm")submitQuote(e.target);
     if(e.target.id==="splitQuoteForm")submitSplitQuote(e.target);
     if(e.target.id==="settingsForm"){
-      const o=formObject(e.target);numericFields(o,["usdCny","gbpCny","airDivisor","expressDivisor","fclUtilization","dutyRate","vatRate","insurancePct","inboundPlacementFee","awdInboundPerBox","awdWestPalletInbound","awdOutboundPerBox","awdTransportBase","awdTransportManaged","awdStorageWestBase","awdStorageWestSmart","awdStorageWestManaged","awdStorageOtherBase","awdStorageOtherSmart","awdStorageOtherManaged"]);
-      state.settings={...state.settings,usdCny:o.usdCny,gbpCny:o.gbpCny,autoFx:e.target.elements.autoFx.checked,airDivisor:o.airDivisor,expressDivisor:o.expressDivisor,fclUtilization:o.fclUtilization,awdInboundPerBox:o.awdInboundPerBox,awdWestPalletInbound:o.awdWestPalletInbound,awdOutboundPerBox:o.awdOutboundPerBox,awdTransportBase:o.awdTransportBase,awdTransportManaged:o.awdTransportManaged,awdStorageWestBase:o.awdStorageWestBase,awdStorageWestSmart:o.awdStorageWestSmart,awdStorageWestManaged:o.awdStorageWestManaged,awdStorageOtherBase:o.awdStorageOtherBase,awdStorageOtherSmart:o.awdStorageOtherSmart,awdStorageOtherManaged:o.awdStorageOtherManaged};
+      const o=formObject(e.target);numericFields(o,["usdCny","gbpCny","airDivisor","expressDivisor","fclUtilization","dutyRate","vatRate","insurancePct","inboundPlacementFee","awdInboundPerBox","awdWestPalletInbound","awdOutboundPerBox","awdTransportBase","awdTransportManaged","awdStorageWestBase","awdStorageWestSmart","awdStorageWestManaged","awdStorageOtherBase","awdStorageOtherSmart","awdStorageOtherManaged","awdFuelSurchargePct"]);
+      state.settings={...state.settings,usdCny:o.usdCny,gbpCny:o.gbpCny,autoFx:e.target.elements.autoFx.checked,airDivisor:o.airDivisor,expressDivisor:o.expressDivisor,fclUtilization:o.fclUtilization,awdInboundPerBox:o.awdInboundPerBox,awdWestPalletInbound:o.awdWestPalletInbound,awdOutboundPerBox:o.awdOutboundPerBox,awdTransportBase:o.awdTransportBase,awdTransportManaged:o.awdTransportManaged,awdStorageWestBase:o.awdStorageWestBase,awdStorageWestSmart:o.awdStorageWestSmart,awdStorageWestManaged:o.awdStorageWestManaged,awdStorageOtherBase:o.awdStorageOtherBase,awdStorageOtherSmart:o.awdStorageOtherSmart,awdStorageOtherManaged:o.awdStorageOtherManaged,awdFuelSurchargePct:o.awdFuelSurchargePct};
       state.shipment={...state.shipment,dutyRate:o.dutyRate,vatRate:o.vatRate,insurancePct:o.insurancePct,inboundPlacementFee:o.inboundPlacementFee,includeTaxes:e.target.elements.includeTaxes.checked};save();render();toast("参数已保存");
     }
   });
@@ -641,11 +676,11 @@
     if(e.target.id==="quoteMarket"){quoteFilter.market=e.target.value;render();}
   });
   document.getElementById("importInput").addEventListener("change", e => {
-    const file=e.target.files[0];if(!file)return;const reader=new FileReader();reader.onload=()=>{try{const x=JSON.parse(reader.result);const imported=x.state||x;if(!imported.shipment||!Array.isArray(imported.quotes))throw new Error();state=imported;save();render();toast("备份已导入");}catch(_){toast("无法导入：文件格式不正确");}};reader.readAsText(file);e.target.value="";
+    const file=e.target.files[0];if(!file)return;const reader=new FileReader();reader.onload=()=>{try{const x=JSON.parse(reader.result);const imported=x.state||x;if(!imported.shipment||!Array.isArray(imported.quotes))throw new Error();state=imported;save();state=loadState();save();render();toast("备份已导入");}catch(_){toast("无法导入：文件格式不正确");}};reader.readAsText(file);e.target.value="";
   });
   document.getElementById("exportBtn").addEventListener("click",exportJson);
   document.getElementById("resetDemo").addEventListener("click",reset);
   render();
   if (state.settings.autoFx) refreshLiveRates(false);
-  setInterval(() => { if (state.settings.autoFx) refreshLiveRates(false); }, 30 * 60 * 1000);
+  setInterval(() => { if (state.settings.autoFx) refreshLiveRates(false); }, 60 * 60 * 1000);
 })();
